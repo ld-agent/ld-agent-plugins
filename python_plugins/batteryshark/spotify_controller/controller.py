@@ -5,9 +5,12 @@ import webbrowser
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Any
+import threading
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class SpotifyController:
-    def __init__(self, client_id: str, client_secret: str, redirect_uri: str = "http://127.0.0.1:8888/callback", cache_path: str = ".cache"):
+    def __init__(self, client_id: str, client_secret: str, redirect_uri: str = "http://127.0.0.1:8888/callback", cache_path: str = ".cache", manual_auth: bool = False):
         """
         Initialize Spotify controller with your app credentials.
         
@@ -16,12 +19,14 @@ class SpotifyController:
             client_secret: Your Spotify app client secret
             redirect_uri: Redirect URI (default uses IPv4 loopback as required by Spotify)
             cache_path: Path to the token cache file
+            manual_auth: If True, skip automatic authentication and allow manual auth flow
         """
         self.scope = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative user-library-read"
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
         self.cache_path = cache_path
+        self.manual_auth = manual_auth
         
         # Ensure cache directory exists
         cache_dir = Path(cache_path).parent
@@ -33,11 +38,12 @@ class SpotifyController:
             redirect_uri=redirect_uri,
             scope=self.scope,
             cache_path=cache_path,
-            open_browser=True  # Auto-open browser for auth
+            open_browser=not manual_auth  # Don't auto-open browser for manual auth
         )
         
         self.sp = None
-        self._initialize_client()
+        if not manual_auth:
+            self._initialize_client()
     
     def _initialize_client(self):
         """Initialize the Spotify client with authentication."""
@@ -354,5 +360,132 @@ class SpotifyController:
             return True
         except Exception as e:
             print(f"Error setting repeat: {e}")
+            return False
+    
+    def get_auth_url(self) -> str:
+        """Get the authorization URL for manual authentication."""
+        return self.auth_manager.get_authorize_url()
+    
+    def authenticate_with_code(self, auth_code: str) -> bool:
+        """
+        Complete authentication using the authorization code from the callback URL.
+        
+        Args:
+            auth_code: The authorization code from the callback URL
+            
+        Returns:
+            True if authentication successful, False otherwise
+        """
+        try:
+            # Get access token using the authorization code
+            token_info = self.auth_manager.get_access_token(code=auth_code)
+            
+            if token_info:
+                self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
+                print("Manual authentication successful!")
+                return True
+            else:
+                print("Failed to get access token")
+                return False
+                
+        except Exception as e:
+            print(f"Error during manual authentication: {e}")
+            return False
+    
+    def authenticate_automatically(self, timeout: int = 120) -> bool:
+        """
+        Perform automatic authentication by starting a temporary local server
+        to catch the OAuth callback. This eliminates the need for manual copy-pasting.
+        
+        Args:
+            timeout: Maximum time to wait for user authorization in seconds
+            
+        Returns:
+            True if authentication successful, False otherwise
+        """
+        print("🎵 Starting Automated Spotify Authentication")
+        print("=" * 50)
+        
+        # Extract port from redirect URI
+        parsed_uri = urllib.parse.urlparse(self.redirect_uri)
+        port = parsed_uri.port or 8888
+        
+        # Shared state between server and main thread
+        auth_result = {'code': None, 'error': None, 'completed': False}
+        
+        class AuthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                # Parse the query parameters
+                query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                
+                if 'code' in query_params:
+                    auth_result['code'] = query_params['code'][0]
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(b"""
+                    <html><body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                        <h1 style="color: #1DB954;">Spotify Authentication Successful!</h1>
+                        <p>You can now close this window and return to your application.</p>
+                        <script>setTimeout(() => window.close(), 3000);</script>
+                    </body></html>
+                    """)
+                elif 'error' in query_params:
+                    auth_result['error'] = query_params['error'][0]
+                    self.send_response(400)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(b"""
+                    <html><body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                        <h1 style="color: #FF6B6B;">Authentication Failed</h1>
+                        <p>There was an error during authentication. Please try again.</p>
+                    </body></html>
+                    """)
+                
+                auth_result['completed'] = True
+            
+            def log_message(self, format, *args):
+                # Suppress server log messages
+                pass
+        
+        # Start the temporary server
+        try:
+            server = HTTPServer(('127.0.0.1', port), AuthHandler)
+            server_thread = threading.Thread(target=server.serve_forever)
+            server_thread.daemon = True
+            server_thread.start()
+            
+            print(f"✅ Temporary server started on http://127.0.0.1:{port}")
+            print("🌐 Opening browser for authentication...")
+            
+            # Get auth URL and open browser
+            auth_url = self.get_auth_url()
+            webbrowser.open(auth_url)
+            
+            print("⏳ Waiting for you to complete authentication in the browser...")
+            print(f"   (Timeout in {timeout} seconds)")
+            
+            # Wait for callback with timeout
+            start_time = time.time()
+            while not auth_result['completed'] and (time.time() - start_time) < timeout:
+                time.sleep(0.5)
+            
+            # Stop the server
+            server.shutdown()
+            server.server_close()
+            
+            if auth_result['completed']:
+                if auth_result['code']:
+                    print("✅ Authorization code received!")
+                    return self.authenticate_with_code(auth_result['code'])
+                elif auth_result['error']:
+                    print(f"❌ Authentication error: {auth_result['error']}")
+                    return False
+            else:
+                print(f"⏰ Authentication timed out after {timeout} seconds")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error during automatic authentication: {e}")
             return False
 

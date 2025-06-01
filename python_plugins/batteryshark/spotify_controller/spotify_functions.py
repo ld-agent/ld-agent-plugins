@@ -3,10 +3,76 @@ from typing import Annotated, Optional, Dict, Any, List
 from pydantic import Field
 from pathlib import Path
 from .controller import SpotifyController
+import stat
+import json
+import tempfile
 
 # Global controller instance
 _spotify_controller = None
 _initialized = False
+
+
+class EnvironmentVariableCacheHandler:
+    """
+    A spotipy cache handler that stores tokens in environment variables.
+    Perfect for production environments where you want process-scoped, ephemeral token storage.
+    """
+    
+    def __init__(self, access_token_env="SPOTIFY_ACCESS_TOKEN", 
+                 refresh_token_env="SPOTIFY_REFRESH_TOKEN",
+                 expires_at_env="SPOTIFY_TOKEN_EXPIRES_AT"):
+        """
+        Initialize the environment variable cache handler.
+        
+        Args:
+            access_token_env: Environment variable name for access token
+            refresh_token_env: Environment variable name for refresh token  
+            expires_at_env: Environment variable name for token expiration timestamp
+        """
+        self.access_token_env = access_token_env
+        self.refresh_token_env = refresh_token_env
+        self.expires_at_env = expires_at_env
+    
+    def get_cached_token(self):
+        """Get token info from environment variables."""
+        access_token = os.getenv(self.access_token_env)
+        refresh_token = os.getenv(self.refresh_token_env)
+        expires_at = os.getenv(self.expires_at_env, "0")
+        
+        if not access_token or not refresh_token:
+            return None
+            
+        try:
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_at": int(expires_at),
+                "scope": os.getenv("SPOTIFY_SCOPE", "")
+            }
+        except ValueError:
+            # Invalid expires_at timestamp
+            return None
+    
+    def save_token_to_cache(self, token_info):
+        """
+        Save token info to environment variables.
+        
+        Note: This only works if the process has permission to modify its environment.
+        In most production environments, you'll set these externally via your deployment platform.
+        """
+        if not token_info:
+            return
+            
+        # Update environment variables for current process
+        # (This won't persist beyond the current process, which is exactly what we want!)
+        os.environ[self.access_token_env] = token_info.get("access_token", "")
+        os.environ[self.refresh_token_env] = token_info.get("refresh_token", "")
+        os.environ[self.expires_at_env] = str(token_info.get("expires_at", 0))
+        
+        if "scope" in token_info:
+            os.environ["SPOTIFY_SCOPE"] = token_info["scope"]
+
 
 def initialize_plugin():
     """
@@ -32,6 +98,36 @@ def reset_controller():
     global _spotify_controller
     _spotify_controller = None
 
+def _secure_cache_file(cache_path: str):
+    """Ensure cache file has secure permissions (600 - owner read/write only)."""
+    cache_file = Path(cache_path)
+    if cache_file.exists():
+        # Set permissions to owner read/write only
+        cache_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+def _get_cache_strategy():
+    """Determine the appropriate cache strategy based on environment."""
+    # Check if we're in a production environment
+    is_production = os.getenv("SPOTIFY_PRODUCTION_MODE", "false").lower() == "true"
+    
+    if is_production or os.getenv("SPOTIFY_ACCESS_TOKEN"):
+        # Production: Use environment variables
+        return "environment"
+    else:
+        # Development: Use file-based cache
+        return "file"
+
+def _create_secure_temp_cache():
+    """Create a secure temporary cache file for production environments."""
+    # Create a temporary file with secure permissions
+    fd, temp_path = tempfile.mkstemp(prefix="spotify_cache_", suffix=".json")
+    os.close(fd)  # Close the file descriptor
+    
+    # Set secure permissions
+    os.chmod(temp_path, stat.S_IRUSR | stat.S_IWUSR)
+    
+    return temp_path
+
 def _get_controller() -> SpotifyController:
     """Get or create the Spotify controller instance."""
     global _spotify_controller
@@ -40,14 +136,43 @@ def _get_controller() -> SpotifyController:
         client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
         
-        # Default cache path to user's home directory
-        default_cache = str(Path.home() / ".spotify_controller.cache")
-        cache_path = os.getenv("SPOTIFY_CACHE_PATH", default_cache)
-        
         if not client_id or not client_secret:
             raise ValueError("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables are required")
         
-        _spotify_controller = SpotifyController(client_id, client_secret, redirect_uri, cache_path=cache_path)
+        cache_strategy = _get_cache_strategy()
+        
+        if cache_strategy == "environment":
+            # PRODUCTION: Use environment variable cache handler (pure environment variables!)
+            print("🔒 Production mode: Using environment variable token storage (process-scoped, zero filesystem exposure)")
+            
+            # Create controller with custom environment variable cache handler
+            from spotipy.oauth2 import SpotifyOAuth
+            import spotipy
+            
+            # Create the OAuth manager with our custom cache handler
+            cache_handler = EnvironmentVariableCacheHandler()
+            auth_manager = SpotifyOAuth(
+                client_id=client_id,
+                client_secret=client_secret,
+                redirect_uri=redirect_uri,
+                scope="user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative user-library-read",
+                cache_handler=cache_handler,
+                open_browser=False  # Don't auto-open browser in production
+            )
+            
+            # Create a minimal SpotifyController that uses our auth manager
+            _spotify_controller = SpotifyController(client_id, client_secret, redirect_uri, manual_auth=True)
+            _spotify_controller.auth_manager = auth_manager
+            _spotify_controller.sp = spotipy.Spotify(auth_manager=auth_manager)
+            
+        else:
+            # DEVELOPMENT: File-based cache for convenience
+            default_cache = str(Path.home() / ".spotify_controller.cache")
+            cache_path = os.getenv("SPOTIFY_CACHE_PATH", default_cache)
+            print(f"🛠️  Development mode: File-based cache at {cache_path}")
+            
+            _spotify_controller = SpotifyController(client_id, client_secret, redirect_uri, cache_path=cache_path)
+            _secure_cache_file(cache_path)
     
     return _spotify_controller
 
