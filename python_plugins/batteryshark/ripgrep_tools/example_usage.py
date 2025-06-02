@@ -1,157 +1,279 @@
-#!/usr/bin/env python3
 """
-Example usage of the ripgrep plugin for ld-agent.
+Example usage of the ripgrep plugin with explicit initialization.
 
-This script demonstrates how to use all the available tools in the ripgrep plugin.
+This demonstrates how to use the new configuration-driven approach for
+both local development and remote deployment scenarios.
 """
 
 import asyncio
-import json
-from typing import Dict, Any
+from pathlib import Path
 
-# Import the plugin tools
-from . import (
+# Import the plugin
+from ripgrep_plugin import (
+    initialize_ripgrep_plugin,
     search_pattern,
-    find_symbol, 
+    find_symbol,
     search_files,
     get_file_context,
-    analyze_codebase
+    analyze_codebase,
 )
 
 
-def pretty_print_result(result: Dict[str, Any], title: str) -> None:
-    """Pretty print a result with a title."""
-    print(f"\n{'='*60}")
-    print(f"🔍 {title}")
-    print(f"{'='*60}")
-    print(json.dumps(result, indent=2))
-
-
-async def main():
-    """Demonstrate all ripgrep plugin tools."""
-    print("🚀 Ripgrep Plugin for ld-agent - Example Usage")
-    print("This script demonstrates all available tools in the plugin.")
+def example_local_development():
+    """Example: Setting up plugin for local development."""
+    print("=== Local Development Mode ===")
     
-    # 1. Search for Python function definitions
-    print("\n1. Searching for Python function definitions...")
-    result = search_pattern(
-        pattern=r"def\s+\w+\s*\(",
-        paths=["."],
-        file_types=["py"],
-        context_lines=2,
-        max_results=5
+    # Initialize for local development
+    # This would typically be done once when the plugin is loaded
+    initialize_ripgrep_plugin(
+        mode="local",
+        workspace_root="/Users/developer/my-project",  # Explicit project root
+        max_results=150,  # Higher limits for local use
+        max_filesize="50M",  # Larger files allowed locally
+        timeout_seconds=60,  # Longer timeout for local use
     )
     
-    if result.get("results") and result["results"]["matches"]:
-        print(f"Found {result['results']['total_matches']} function definitions")
-        for match in result["results"]["matches"][:3]:  # Show first 3
-            print(f"  📄 {match['file']}:{match['line']}: {match['content'].strip()}")
-    else:
-        print("  No function definitions found")
+    # Now use the tools
+    results = search_pattern("class.*Controller", file_types=["py", "js"])
+    print(f"Found {results['results']['total_matches']} controller classes")
 
-    # 2. Find specific symbols (classes)
-    print("\n2. Finding 'Config' class definitions...")
-    result = find_symbol(
-        symbol="Config",
-        symbol_type="class",
-        exact_match=False
+
+def example_local_auto_workspace():
+    """Example: Auto-detect workspace for local development."""
+    print("=== Local Auto-Workspace Mode ===")
+    
+    # Initialize with minimal config - will auto-detect current workspace
+    initialize_ripgrep_plugin(
+        mode="local",
+        # No workspace_root specified - will use current directory
     )
     
-    if result.get("results") and result["results"]["matches"]:
-        print(f"Found {result['results']['total_matches']} Config class(es)")
-        for match in result["results"]["matches"]:
-            print(f"  📄 {match['file']}:{match['line']}: {match['definition'].strip()}")
-    else:
-        print("  No Config classes found")
+    # Search in the detected workspace
+    files = search_files(name_pattern="*.md")
+    print(f"Found {files['results']['total_files']} markdown files")
 
-    # 3. Search for Python files
-    print("\n3. Finding Python files...")
-    result = search_files(
-        name_pattern="*.py",
-        include_stats=True
+
+def example_remote_single_tenant():
+    """Example: Remote deployment with single tenant."""
+    print("=== Remote Single-Tenant Mode ===")
+    
+    # Initialize for remote single-tenant deployment
+    initialize_ripgrep_plugin(
+        mode="remote",
+        workspace_root="/app/workspace",  # Server-controlled workspace
+        max_results=50,  # Conservative limits for remote
+        max_filesize="5M",  # Smaller files for remote
+        timeout_seconds=15,  # Faster timeout for remote
     )
     
-    if result.get("results") and result["results"]["files"]:
-        print(f"Found {result['results']['total_files']} Python files")
-        for file in result["results"]["files"][:5]:  # Show first 5
-            size_kb = (file.get("size", 0) or 0) / 1024
-            print(f"  📄 {file['path']} ({size_kb:.1f} KB)")
-    else:
-        print("  No Python files found")
+    # Tools automatically use the restricted configuration
+    analysis = analyze_codebase()
+    print(f"Analyzed codebase: {analysis['results']['summary']}")
 
-    # 4. Search for files containing 'async def'
-    print("\n4. Finding files containing 'async def'...")
-    result = search_files(
-        content_pattern="async def",
-        include_stats=True
+
+def example_remote_multi_tenant():
+    """Example: Remote deployment with multi-tenancy."""
+    print("=== Remote Multi-Tenant Mode ===")
+    
+    # This would be called by the server for each tenant
+    tenant_id = "user_123"
+    
+    # Initialize with tenant isolation
+    initialize_ripgrep_plugin(
+        mode="remote",
+        tenant_id=tenant_id,  # Creates /workspace/user_123/
+        max_results=25,  # Very conservative for multi-tenant
+        timeout_seconds=10,  # Fast timeout
+        blocked_patterns=[  # Extra security patterns
+            ".git", "node_modules", "__pycache__",
+            ".*", "*.env", "*.key", "*.secret",
+            "/etc", "/var", "/usr", "/bin", "/root",
+            "config", "secrets", "private"
+        ]
     )
     
-    if result.get("results") and result["results"]["files"]:
-        print(f"Found {result['results']['total_files']} files with async functions")
-        for file in result["results"]["files"][:3]:  # Show first 3
-            print(f"  📄 {file['path']} ({file.get('match_count', 0)} matches)")
-    else:
-        print("  No files with async functions found")
+    # All searches are automatically isolated to /workspace/user_123/
+    symbols = find_symbol("main", symbol_type="function")
+    print(f"Found {symbols['results']['total_found']} main functions for tenant {tenant_id}")
 
-    # 5. Get context from a specific file (if available)
-    if result.get("results") and result["results"]["files"]:
-        first_file = result["results"]["files"][0]["path"]
-        print(f"\n5. Getting context from line 10 in {first_file}...")
+
+def example_mcp_server_usage():
+    """Example: How an MCP server would use this plugin."""
+    print("=== MCP Server Usage ===")
+    
+    class MockMCPServer:
+        def __init__(self):
+            # Server initialization - configure plugin once at startup
+            initialize_ripgrep_plugin(
+                mode="remote",
+                workspace_root="/mcp/shared-workspace",
+                max_results=75,
+                timeout_seconds=20,
+            )
         
-        context_result = get_file_context(
-            file_path=first_file,
-            line_number=10,
-            context_lines=3,
-            include_line_numbers=True
-        )
+        def handle_search_request(self, pattern: str):
+            """Handle incoming search request from MCP client."""
+            # Plugin is already configured, just use the tools
+            return search_pattern(pattern, max_results=25)
         
-        if context_result.get("result"):
-            ctx = context_result["result"]
-            print(f"  📄 {ctx['file']}:{ctx['target_line']}")
-            print(f"  Context ({ctx['total_context_lines']} lines):")
+        def handle_tenant_request(self, tenant_id: str, query: str):
+            """Handle request for specific tenant - requires re-initialization."""
+            # Re-initialize for this tenant's context
+            initialize_ripgrep_plugin(
+                mode="remote",
+                tenant_id=tenant_id,
+                max_results=50,
+            )
             
-            for line in ctx.get("before_context", []):
-                print(f"    {line}")
-            print(f"  > {ctx['content']}")
-            for line in ctx.get("after_context", []):
-                print(f"    {line}")
-        else:
-            print(f"  Could not get context: {context_result.get('error', 'Unknown error')}")
+            # Now search within tenant's isolated workspace
+            return search_pattern(query)
+    
+    # Simulate server usage
+    server = MockMCPServer()
+    result = server.handle_search_request("import.*requests")
+    print(f"MCP search result: {result['results']['total_matches']} matches")
 
-    # 6. Analyze the current codebase
-    print("\n6. Analyzing codebase structure...")
-    result = analyze_codebase(
-        paths=["."],
-        include_metrics=True,
-        include_language_stats=True,
-        max_files_to_scan=100  # Limit for example
+
+def example_ld_agent_usage():
+    """Example: How ld-agent would use this plugin."""
+    print("=== ld-agent Usage ===")
+    
+    # ld-agent would call the init function during plugin loading
+    # Configuration could come from environment, config files, or agent settings
+    
+    # For a local agent
+    initialize_ripgrep_plugin(
+        mode="local",
+        workspace_root=str(Path.cwd()),  # Current working directory
+        max_results=200,  # Higher limits for local agent
     )
     
-    if result.get("results"):
-        stats = result["results"]
-        summary = stats.get("summary", {})
-        
-        print(f"  📊 Total files: {summary.get('total_files', 0)}")
-        print(f"  📊 Total size: {summary.get('total_size_mb', 0):.1f} MB")
-        
-        if summary.get("total_lines"):
-            print(f"  📊 Total lines: {summary['total_lines']:,}")
-        
-        print("  📊 File types:")
-        file_types = stats.get("file_types", {})
-        for ext, count in sorted(file_types.items())[:5]:  # Top 5
-            print(f"    .{ext}: {count} files")
-        
-        if stats.get("language_stats"):
-            print("  📊 Languages:")
-            for lang, info in stats["language_stats"].items():
-                print(f"    {lang}: {info['files']} files")
+    # Agent can now use tools directly
+    context = get_file_context("README.md", line_number=1, context_lines=5)
+    if context['error'] is None:
+        print(f"File context retrieved: {context['result']['file']}")
+    else:
+        print(f"Error: {context['error']}")
 
-    print("\n✅ Example completed!")
-    print("\nℹ️  This plugin provides powerful code search capabilities for AI agents.")
-    print("   Configure with environment variables like RIPGREP_MAX_RESULTS, etc.")
+
+def example_security_boundaries():
+    """Example: Demonstrating security boundary enforcement."""
+    print("=== Security Boundaries Demo ===")
+    
+    # Initialize with restricted paths
+    initialize_ripgrep_plugin(
+        mode="remote",
+        allowed_paths=["/workspace/safe-area"],
+        blocked_patterns=["secrets", "*.key", ".env"],
+    )
+    
+    try:
+        # This should work - within allowed path
+        results = search_files(name_pattern="*.py", paths=["/workspace/safe-area/src"])
+        print(f"Allowed search succeeded: {results['results']['total_files']} files")
+    except PermissionError as e:
+        print(f"Expected security error: {e}")
+    
+    try:
+        # This should fail - outside allowed path
+        results = search_files(name_pattern="*.py", paths=["/etc"])
+        print("This shouldn't print - security should block it")
+    except PermissionError as e:
+        print(f"Security correctly blocked: {e}")
+
+
+def example_configuration_flexibility():
+    """Example: Showing configuration flexibility."""
+    print("=== Configuration Flexibility ===")
+    
+    # Development environment - permissive
+    initialize_ripgrep_plugin(
+        mode="local",
+        workspace_root="/Users/dev/project",
+        max_results=500,
+        max_filesize="100M",
+        timeout_seconds=120,
+        blocked_patterns=[".git", "node_modules"],  # Minimal blocking
+    )
+    
+    # Production environment - restrictive
+    # initialize_ripgrep_plugin(
+    #     mode="remote",
+    #     allowed_paths=["/app/workspace"],
+    #     max_results=25,
+    #     max_filesize="1M",
+    #     timeout_seconds=5,
+    #     blocked_patterns=[
+    #         ".git", "node_modules", "__pycache__",
+    #         ".*", "*.env", "*.key", "*.secret", "*.pem",
+    #         "config", "secrets", "private", "internal"
+    #     ]
+    # )
+    
+    print("Plugin configured for development environment")
 
 
 if __name__ == "__main__":
-    # Run the example
-    asyncio.run(main()) 
+    """Run examples to demonstrate the plugin usage patterns."""
+    
+    try:
+        print("Ripgrep Plugin Configuration Examples")
+        print("=" * 50)
+        
+        # Run examples (commented out to avoid actual execution)
+        # example_local_development()
+        # example_local_auto_workspace()
+        # example_remote_single_tenant()
+        # example_remote_multi_tenant()
+        # example_mcp_server_usage()
+        # example_ld_agent_usage()
+        # example_security_boundaries()
+        example_configuration_flexibility()
+        
+        print("\nAll examples completed successfully!")
+        
+    except Exception as e:
+        print(f"Example execution failed: {e}")
+
+
+# Additional helper functions for integration
+
+def create_local_config(workspace_path: str = None) -> dict:
+    """Create a standard local development configuration."""
+    return {
+        "mode": "local",
+        "workspace_root": workspace_path or str(Path.cwd()),
+        "max_results": 200,
+        "max_filesize": "50M",
+        "timeout_seconds": 60,
+        "blocked_patterns": [".git", "node_modules", "__pycache__", ".pytest_cache"]
+    }
+
+
+def create_remote_config(tenant_id: str = None, workspace_root: str = None) -> dict:
+    """Create a standard remote deployment configuration."""
+    config = {
+        "mode": "remote",
+        "max_results": 50,
+        "max_filesize": "5M",
+        "timeout_seconds": 15,
+        "blocked_patterns": [
+            ".git", "node_modules", "__pycache__",
+            ".*", "*.env", "*.key", "*.secret", "*.pem",
+            "/etc", "/var", "/usr", "/bin", "/sbin", "/root"
+        ]
+    }
+    
+    if tenant_id:
+        config["tenant_id"] = tenant_id
+    elif workspace_root:
+        config["workspace_root"] = workspace_root
+    else:
+        raise ValueError("Remote config requires either tenant_id or workspace_root")
+    
+    return config
+
+
+def initialize_from_config(config: dict):
+    """Initialize plugin from configuration dictionary."""
+    initialize_ripgrep_plugin(**config) 

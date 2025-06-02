@@ -1,186 +1,231 @@
 """
-Implementation module for ripgrep plugin.
+Implementation module for the ripgrep plugin.
 
-This module contains the actual business logic for ripgrep-based code search tools.
+This module contains the actual implementation of all the plugin functions,
+separated from the public API for better organization and testability.
 """
 
 import asyncio
 import json
-import logging
 import os
 import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Any, Tuple
+import ripgrepy
 
-# Try to import ripgrepy, fall back to CLI-only mode if not available
-try:
-    from ripgrepy import Ripgrepy, RipGrepNotFound
-    HAS_RIPGREPY = True
-except ImportError:
-    HAS_RIPGREPY = False
-    logging.warning("ripgrepy not available, falling back to CLI-only mode")
+# Global configuration state
+_plugin_config = {
+    "initialized": False,
+    "mode": "local",
+    "allowed_paths": [],
+    "blocked_patterns": [],
+    "max_results": 100,
+    "max_filesize": "10M",
+    "timeout_seconds": 30,
+    "tenant_id": None,
+}
 
 
-class Config:
-    """Configuration for ripgrep operations based on environment variables."""
+def initialize_security_config(
+    mode: str,
+    allowed_paths: List[str],
+    blocked_patterns: List[str],
+    max_results: int,
+    max_filesize: str,
+    timeout_seconds: int,
+    tenant_id: Optional[str] = None,
+) -> None:
+    """Initialize the global security configuration."""
+    global _plugin_config
     
-    def __init__(self):
-        self.ripgrep_path = os.getenv("RIPGREP_PATH", "rg")
-        self.max_results = int(os.getenv("RIPGREP_MAX_RESULTS", "100"))
-        self.max_filesize = os.getenv("RIPGREP_MAX_FILESIZE", "10M")
-        self.timeout_seconds = int(os.getenv("RIPGREP_TIMEOUT", "30"))
-        
-        # Parse allowed paths
-        allowed_paths_str = os.getenv("RIPGREP_ALLOWED_PATHS", "")
-        self.allowed_paths = [p.strip() for p in allowed_paths_str.split(",") if p.strip()] if allowed_paths_str else None
-        
-        # Parse blocked patterns
-        blocked_patterns_str = os.getenv("RIPGREP_BLOCKED_PATTERNS", ".git,node_modules,__pycache__,.pytest_cache")
-        self.blocked_patterns = [p.strip() for p in blocked_patterns_str.split(",") if p.strip()]
-        
-        self.default_file_types = ["py", "js", "ts", "jsx", "tsx", "java", "c", "cpp", "h", "hpp", "cs", "go", "rs", "rb", "php", "md"]
+    _plugin_config.update({
+        "initialized": True,
+        "mode": mode,
+        "allowed_paths": allowed_paths,
+        "blocked_patterns": blocked_patterns,
+        "max_results": max_results,
+        "max_filesize": max_filesize,
+        "timeout_seconds": timeout_seconds,
+        "tenant_id": tenant_id,
+    })
 
-    def is_path_allowed(self, path: Union[str, Path]) -> bool:
-        """Check if a path is allowed based on configuration."""
-        if not self.allowed_paths:
-            return True
-            
-        path = Path(path).resolve()
+
+def _check_initialized() -> None:
+    """Check if the plugin has been initialized."""
+    if not _plugin_config["initialized"]:
+        raise RuntimeError(
+            "Plugin has not been initialized. Call initialize_ripgrep_plugin() first."
+        )
+
+
+def _validate_paths(paths: Optional[List[str]]) -> List[str]:
+    """Validate that search paths are within allowed boundaries."""
+    _check_initialized()
+    
+    if paths is None:
+        # Use configured allowed paths
+        return _plugin_config["allowed_paths"]
+    
+    validated_paths = []
+    allowed_paths = [Path(p).resolve() for p in _plugin_config["allowed_paths"]]
+    
+    for path in paths:
+        path_obj = Path(path).resolve()
         
-        for allowed_path in self.allowed_paths:
+        # Check if path is within any allowed path
+        is_allowed = False
+        for allowed_path in allowed_paths:
             try:
-                allowed_path = Path(allowed_path).resolve()
-                # Check if path is within allowed directory
-                path.relative_to(allowed_path)
-                return True
-            except (ValueError, OSError):
+                path_obj.relative_to(allowed_path)
+                is_allowed = True
+                break
+            except ValueError:
                 continue
-                
-        return False
-    
-    def is_pattern_blocked(self, path: Union[str, Path]) -> bool:
-        """Check if a path contains blocked patterns."""
-        path_str = str(path)
-        return any(pattern in path_str for pattern in self.blocked_patterns)
-
-
-def _verify_ripgrep() -> None:
-    """Verify that ripgrep is available."""
-    config = Config()
-    try:
-        result = subprocess.run(
-            [config.ripgrep_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ripgrep not working at {config.ripgrep_path}")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        raise RuntimeError(f"ripgrep not found at {config.ripgrep_path}")
-
-
-def _build_symbol_pattern(symbol: str, symbol_type: str, exact_match: bool) -> str:
-    """Build a regex pattern for finding symbols."""
-    if exact_match:
-        symbol_pattern = re.escape(symbol)
-    else:
-        symbol_pattern = symbol
         
-    if symbol_type.lower() == "function":
-        # Match function definitions in various languages
-        patterns = [
-            rf"def\s+{symbol_pattern}\s*\(",  # Python
-            rf"function\s+{symbol_pattern}\s*\(",  # JavaScript
-            rf"{symbol_pattern}\s*\([^)]*\)\s*{{",  # C/Java/etc
-            rf"fn\s+{symbol_pattern}\s*\(",  # Rust
-        ]
-        return "|".join(patterns)
-    elif symbol_type.lower() == "class":
-        patterns = [
-            rf"class\s+{symbol_pattern}",  # Python/Java/C#
-            rf"struct\s+{symbol_pattern}",  # C/C++/Rust
-            rf"interface\s+{symbol_pattern}",  # TypeScript/Java
-        ]
-        return "|".join(patterns)
-    elif symbol_type.lower() == "variable":
-        patterns = [
-            rf"let\s+{symbol_pattern}\s*=",  # JavaScript/TypeScript
-            rf"var\s+{symbol_pattern}\s*=",  # JavaScript
-            rf"const\s+{symbol_pattern}\s*=",  # JavaScript/TypeScript
-            rf"{symbol_pattern}\s*=",  # General assignment
-        ]
-        return "|".join(patterns)
-    else:
-        # ANY or other types - just search for the symbol
-        return symbol_pattern
-
-
-async def _run_ripgrep_command(cmd: List[str]) -> str:
-    """Run a ripgrep command asynchronously."""
-    config = Config()
+        if not is_allowed:
+            raise PermissionError(
+                f"Path '{path}' is not within allowed search boundaries. "
+                f"Allowed paths: {_plugin_config['allowed_paths']}"
+            )
+        
+        validated_paths.append(str(path_obj))
     
-    def _run():
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=config.timeout_seconds,
+    return validated_paths
+
+
+def _get_ripgrep_executable() -> str:
+    """Get the ripgrep executable path."""
+    return os.environ.get("RIPGREP_PATH", "rg")
+
+
+def _should_block_pattern(pattern: str) -> bool:
+    """Check if a pattern should be blocked for security."""
+    _check_initialized()
+    
+    # Block patterns that might access sensitive files
+    if _plugin_config["mode"] == "remote":
+        dangerous_patterns = [
+            r"\.env", r"\.key", r"\.pem", r"password", r"secret",
+            r"/etc/", r"/var/", r"/usr/", r"/bin/", r"/sbin/",
+            r"id_rsa", r"private", r"token"
+        ]
+        
+        for dangerous in dangerous_patterns:
+            if re.search(dangerous, pattern, re.IGNORECASE):
+                return True
+    
+    return False
+
+
+def _build_ripgrep_command(
+    pattern: str,
+    paths: List[str],
+    file_types: Optional[List[str]] = None,
+    context_lines: int = 0,
+    case_sensitive: bool = False,
+    whole_words: bool = False,
+    files_only: bool = False,
+    max_count: Optional[int] = None,
+) -> List[str]:
+    """Build ripgrep command with proper arguments."""
+    cmd = [_get_ripgrep_executable()]
+    
+    # Basic search options
+    if not case_sensitive:
+        cmd.append("--smart-case")
+    
+    if whole_words:
+        cmd.append("--word-regexp")
+    
+    if files_only:
+        cmd.append("--files-with-matches")
+    
+    # Context lines
+    if context_lines > 0:
+        cmd.extend(["-C", str(context_lines)])
+    
+    # File type filters
+    if file_types:
+        for file_type in file_types:
+            # Remove leading dot if present
+            file_type = file_type.lstrip(".")
+            cmd.extend(["-t", file_type])
+    
+    # Output format
+    cmd.extend(["--json", "--line-number", "--column"])
+    
+    # Size limit
+    if _plugin_config["max_filesize"]:
+        cmd.extend(["--max-filesize", _plugin_config["max_filesize"]])
+    
+    # Blocked patterns
+    for blocked in _plugin_config["blocked_patterns"]:
+        cmd.extend(["--glob", f"!{blocked}"])
+    
+    # Max count
+    if max_count:
+        cmd.extend(["-m", str(max_count)])
+    
+    # Pattern and paths
+    cmd.append(pattern)
+    cmd.extend(paths)
+    
+    return cmd
+
+
+async def _run_ripgrep_command(cmd: List[str]) -> Tuple[str, str, int]:
+    """Run ripgrep command asynchronously with timeout."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=_plugin_config["allowed_paths"][0] if _plugin_config["allowed_paths"] else None,
         )
+        
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=_plugin_config["timeout_seconds"]
+        )
+        
+        return stdout.decode(), stderr.decode(), process.returncode
     
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, _run)
+    except asyncio.TimeoutError:
+        if process:
+            process.terminate()
+            await process.wait()
+        raise RuntimeError(f"Search timed out after {_plugin_config['timeout_seconds']} seconds")
     
-    if result.returncode != 0 and result.stderr:
-        logging.warning(f"ripgrep warning: {result.stderr}")
-    
-    return result.stdout
+    except Exception as e:
+        raise RuntimeError(f"Failed to execute ripgrep: {e}")
 
 
 def _parse_ripgrep_json_output(output: str) -> List[Dict[str, Any]]:
-    """Parse ripgrep JSON output into match objects."""
-    matches = []
+    """Parse ripgrep JSON output into structured results."""
+    results = []
     
     for line in output.strip().split('\n'):
         if not line:
             continue
-            
+        
         try:
-            data = json.loads(line)
-            if data.get('type') == 'match':
-                match_data = data.get('data', {})
-                
-                file_path = match_data.get('path', {}).get('text', '')
-                line_number = match_data.get('line_number', 0)
-                content = match_data.get('lines', {}).get('text', '').rstrip('\n')
-                
-                # Extract byte offset if available
-                byte_offset = match_data.get('absolute_offset')
-                
-                # Extract column from submatches if available
-                column = None
-                submatches = match_data.get('submatches', [])
-                if submatches:
-                    column = submatches[0].get('start')
-                
-                match = {
-                    "file": file_path,
-                    "line": line_number,
-                    "column": column,
-                    "content": content,
+            entry = json.loads(line)
+            if entry.get("type") == "match":
+                data = entry.get("data", {})
+                results.append({
+                    "file": data.get("path", {}).get("text", ""),
+                    "line": data.get("line_number"),
+                    "column": data.get("submatches", [{}])[0].get("start", 0) + 1,
+                    "content": data.get("lines", {}).get("text", "").rstrip(),
                     "before_context": [],
                     "after_context": [],
-                    "byte_offset": byte_offset,
-                }
-                matches.append(match)
-                
+                })
         except json.JSONDecodeError:
-            # Skip malformed JSON lines
             continue
-            
-    return matches
+    
+    return results
 
 
 async def search_pattern_impl(
@@ -192,96 +237,76 @@ async def search_pattern_impl(
     whole_words: bool = False,
     max_results: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Implementation of pattern search functionality."""
-    if not pattern:
-        return {
-            "query": {"pattern": pattern, "paths": paths, "options": {}},
-            "results": {"total_matches": 0, "files_searched": 0, "files_with_matches": 0, "matches": []},
-            "error": "Pattern cannot be empty"
-        }
-    
-    config = Config()
+    """Implementation for search_pattern function."""
     start_time = time.time()
-    paths = paths or ["."]
-    
-    # Validate paths
-    for path in paths:
-        if not config.is_path_allowed(path):
-            return {
-                "query": {"pattern": pattern, "paths": paths},
-                "results": {"total_matches": 0, "files_searched": 0, "files_with_matches": 0, "matches": []},
-                "error": f"Path not allowed: {path}"
-            }
     
     try:
-        _verify_ripgrep()
+        # Validate inputs
+        if not pattern.strip():
+            raise ValueError("Search pattern cannot be empty")
         
-        # Build ripgrep command
-        cmd = [config.ripgrep_path, "--json", "--line-number", "--with-filename"]
+        if _should_block_pattern(pattern):
+            raise ValueError("Search pattern contains blocked content")
         
-        if case_sensitive:
-            cmd.append("--case-sensitive")
-        else:
-            cmd.append("--smart-case")
+        # Validate and resolve paths
+        validated_paths = _validate_paths(paths)
         
-        if whole_words:
-            cmd.append("--word-regexp")
+        # Apply result limits
+        effective_max_results = min(
+            max_results or _plugin_config["max_results"],
+            _plugin_config["max_results"]
+        )
         
-        if context_lines > 0:
-            cmd.extend(["--context", str(context_lines)])
+        # Build and run command
+        cmd = _build_ripgrep_command(
+            pattern=pattern,
+            paths=validated_paths,
+            file_types=file_types,
+            context_lines=context_lines,
+            case_sensitive=case_sensitive,
+            whole_words=whole_words,
+            max_count=effective_max_results,
+        )
         
-        if file_types:
-            for file_type in file_types:
-                cmd.extend(["--type", file_type])
+        stdout, stderr, returncode = await _run_ripgrep_command(cmd)
         
-        if max_results or config.max_results:
-            limit = max_results or config.max_results
-            cmd.extend(["--max-count", str(limit)])
+        # Parse results
+        matches = _parse_ripgrep_json_output(stdout)
         
-        cmd.extend(["--max-filesize", config.max_filesize])
-        
-        # Add blocked patterns as globs
-        for blocked_pattern in config.blocked_patterns:
-            cmd.extend(["--glob", f"!{blocked_pattern}"])
-        
-        cmd.append(pattern)
-        cmd.extend(paths)
-        
-        # Run search
-        output = await _run_ripgrep_command(cmd)
-        matches = _parse_ripgrep_json_output(output)
-        
-        # Calculate statistics
-        files_with_matches = len(set(match["file"] for match in matches))
-        search_time = (time.time() - start_time) * 1000
+        # Limit results
+        if len(matches) > effective_max_results:
+            matches = matches[:effective_max_results]
         
         return {
             "query": {
                 "pattern": pattern,
-                "paths": paths,
-                "options": {
-                    "case_sensitive": case_sensitive,
-                    "whole_words": whole_words,
-                    "context_lines": context_lines,
-                    "file_types": file_types,
-                }
+                "paths": validated_paths,
+                "file_types": file_types,
+                "context_lines": context_lines,
+                "case_sensitive": case_sensitive,
+                "whole_words": whole_words,
+                "max_results": effective_max_results,
             },
             "results": {
                 "total_matches": len(matches),
-                "files_searched": 0,  # ripgrep doesn't provide this easily
-                "files_with_matches": files_with_matches,
-                "search_time_ms": search_time,
-                "truncated": max_results and len(matches) >= max_results,
+                "search_time": time.time() - start_time,
                 "matches": matches,
             },
             "error": None,
         }
-        
+    
     except Exception as e:
         return {
-            "query": {"pattern": pattern, "paths": paths},
-            "results": {"total_matches": 0, "files_searched": 0, "files_with_matches": 0, "matches": []},
-            "error": str(e)
+            "query": {
+                "pattern": pattern,
+                "paths": paths,
+                "file_types": file_types,
+                "context_lines": context_lines,
+                "case_sensitive": case_sensitive,
+                "whole_words": whole_words,
+            },
+            "results": None,
+            "error": str(e),
         }
 
 
@@ -291,53 +316,97 @@ async def find_symbol_impl(
     paths: Optional[List[str]] = None,
     exact_match: bool = False,
 ) -> Dict[str, Any]:
-    """Implementation of symbol finding functionality."""
-    if not symbol:
+    """Implementation for find_symbol function."""
+    try:
+        if not symbol.strip():
+            raise ValueError("Symbol name cannot be empty")
+        
+        # Define symbol patterns
+        symbol_patterns = {
+            "function": [
+                rf"def\s+{symbol}\s*\(",  # Python
+                rf"function\s+{symbol}\s*\(",  # JavaScript
+                rf"fn\s+{symbol}\s*\(",  # Rust
+                rf"{symbol}\s*:\s*function",  # JavaScript object method
+            ],
+            "class": [
+                rf"class\s+{symbol}\s*[:\(]",  # Python, C++
+                rf"struct\s+{symbol}\s*\{{",  # C/C++, Rust
+                rf"interface\s+{symbol}\s*\{{",  # TypeScript
+            ],
+            "variable": [
+                rf"let\s+{symbol}\s*=",  # JavaScript
+                rf"var\s+{symbol}\s*=",  # JavaScript
+                rf"const\s+{symbol}\s*=",  # JavaScript
+                rf"{symbol}\s*=\s*",  # General assignment
+            ],
+            "any": [rf"\b{symbol}\b"],  # Any occurrence
+        }
+        
+        if symbol_type not in symbol_patterns:
+            symbol_type = "any"
+        
+        patterns = symbol_patterns[symbol_type]
+        
+        # Search for each pattern
+        all_matches = []
+        validated_paths = _validate_paths(paths)
+        
+        for pattern in patterns:
+            cmd = _build_ripgrep_command(
+                pattern=pattern,
+                paths=validated_paths,
+                case_sensitive=exact_match,
+                max_count=_plugin_config["max_results"],
+            )
+            
+            stdout, stderr, returncode = await _run_ripgrep_command(cmd)
+            matches = _parse_ripgrep_json_output(stdout)
+            
+            for match in matches:
+                match.update({
+                    "symbol_name": symbol,
+                    "symbol_type": symbol_type,
+                    "definition": match["content"],
+                    "scope": "unknown",
+                })
+            
+            all_matches.extend(matches)
+        
+        # Remove duplicates based on file and line
+        seen = set()
+        unique_matches = []
+        for match in all_matches:
+            key = (match["file"], match["line"])
+            if key not in seen:
+                seen.add(key)
+                unique_matches.append(match)
+        
         return {
-            "query": {"symbol": symbol, "symbol_type": symbol_type, "paths": paths, "exact_match": exact_match},
-            "results": {"total_matches": 0, "matches": []}
+            "query": {
+                "symbol": symbol,
+                "symbol_type": symbol_type,
+                "paths": validated_paths,
+                "exact_match": exact_match,
+            },
+            "results": {
+                "total_found": len(unique_matches),
+                "symbols": unique_matches,
+            },
+            "error": None,
         }
     
-    # Build pattern based on symbol type
-    pattern = _build_symbol_pattern(symbol, symbol_type, exact_match)
-    
-    # Use the pattern search with appropriate file types
-    config = Config()
-    result = await search_pattern_impl(
-        pattern=pattern,
-        paths=paths,
-        file_types=config.default_file_types,
-        context_lines=2,
-    )
-    
-    # Convert to symbol match format
-    symbol_matches = []
-    if result.get("results") and result["results"].get("matches"):
-        for match in result["results"]["matches"]:
-            symbol_match = {
-                "symbol_name": symbol,
+    except Exception as e:
+        return {
+            "query": {
+                "symbol": symbol,
                 "symbol_type": symbol_type,
-                "file": match["file"],
-                "line": match["line"],
-                "column": match.get("column"),
-                "definition": match["content"],
-                "context": match.get("before_context", []) + match.get("after_context", []),
-                "scope": None,  # Could be enhanced to detect scope
-            }
-            symbol_matches.append(symbol_match)
-    
-    return {
-        "query": {
-            "symbol": symbol,
-            "symbol_type": symbol_type,
-            "paths": paths,
-            "exact_match": exact_match,
-        },
-        "results": {
-            "total_matches": len(symbol_matches),
-            "matches": symbol_matches,
-        },
-    }
+                "paths": paths,
+                "exact_match": exact_match,
+            },
+            "results": None,
+            "error": str(e),
+        }
 
 
 async def search_files_impl(
@@ -347,114 +416,122 @@ async def search_files_impl(
     max_size: Optional[str] = None,
     include_stats: bool = True,
 ) -> Dict[str, Any]:
-    """Implementation of file search functionality."""
-    config = Config()
-    paths = paths or ["."]
-    
-    # Validate paths
-    for path in paths:
-        if not config.is_path_allowed(path):
-            return {
-                "query": {"name_pattern": name_pattern, "content_pattern": content_pattern, "paths": paths},
-                "results": {"total_files": 0, "files": []},
-                "error": f"Path not allowed: {path}"
-            }
-    
+    """Implementation for search_files function."""
     try:
-        _verify_ripgrep()
-        files = []
+        if not name_pattern and not content_pattern:
+            raise ValueError("Either name_pattern or content_pattern must be provided")
+        
+        validated_paths = _validate_paths(paths)
+        results = []
+        
+        if name_pattern:
+            # Use ripgrep's file listing capability
+            cmd = [_get_ripgrep_executable(), "--files"]
+            
+            # Add glob pattern
+            cmd.extend(["--glob", name_pattern])
+            
+            # Size limit
+            if max_size or _plugin_config["max_filesize"]:
+                size_limit = max_size or _plugin_config["max_filesize"]
+                cmd.extend(["--max-filesize", size_limit])
+            
+            # Blocked patterns
+            for blocked in _plugin_config["blocked_patterns"]:
+                cmd.extend(["--glob", f"!{blocked}"])
+            
+            cmd.extend(validated_paths)
+            
+            stdout, stderr, returncode = await _run_ripgrep_command(cmd)
+            
+            for line in stdout.strip().split('\n'):
+                if line:
+                    file_path = line.strip()
+                    file_info = {"path": file_path}
+                    
+                    if include_stats:
+                        try:
+                            path_obj = Path(file_path)
+                            if path_obj.exists():
+                                stat = path_obj.stat()
+                                file_info.update({
+                                    "size": stat.st_size,
+                                    "file_type": path_obj.suffix.lstrip('.') or 'no_extension',
+                                })
+                        except Exception:
+                            pass
+                    
+                    results.append(file_info)
         
         if content_pattern:
-            # Search for files containing specific content
-            result = await search_pattern_impl(
+            # Search within files
+            cmd = _build_ripgrep_command(
                 pattern=content_pattern,
-                paths=paths,
-                file_types=config.default_file_types if not name_pattern else None,
+                paths=validated_paths,
+                files_only=True,
+                max_count=_plugin_config["max_results"],
             )
             
-            # Group by file and count matches
-            file_matches = {}
-            if result.get("results") and result["results"].get("matches"):
-                for match in result["results"]["matches"]:
-                    file_path = match["file"]
-                    if file_path not in file_matches:
-                        file_matches[file_path] = 0
-                    file_matches[file_path] += 1
+            stdout, stderr, returncode = await _run_ripgrep_command(cmd)
             
-            for file_path, match_count in file_matches.items():
-                if config.is_pattern_blocked(file_path):
-                    continue
-                
-                try:
-                    stat = os.stat(file_path)
-                    file_info = {
-                        "path": file_path,
-                        "size": stat.st_size if include_stats else None,
-                        "match_count": match_count,
-                        "file_type": Path(file_path).suffix[1:] if Path(file_path).suffix else None,
-                    }
-                    files.append(file_info)
-                except OSError:
-                    continue
-        else:
-            # Find files by name pattern
-            cmd = [config.ripgrep_path, "--files"]
-            
-            if name_pattern:
-                cmd.extend(["--glob", name_pattern])
-            
-            if max_size:
-                cmd.extend(["--max-filesize", max_size])
-            elif config.max_filesize:
-                cmd.extend(["--max-filesize", config.max_filesize])
-            
-            # Add blocked patterns
-            for blocked_pattern in config.blocked_patterns:
-                cmd.extend(["--glob", f"!{blocked_pattern}"])
-            
-            cmd.extend(paths)
-            
-            output = await _run_ripgrep_command(cmd)
-            
-            for line in output.strip().split('\n'):
-                if not line:
-                    continue
-                
-                file_path = line.strip()
-                if config.is_pattern_blocked(file_path):
-                    continue
-                
-                try:
-                    stat = os.stat(file_path)
-                    file_info = {
-                        "path": file_path,
-                        "size": stat.st_size if include_stats else None,
-                        "file_type": Path(file_path).suffix[1:] if Path(file_path).suffix else None,
-                        "line_count": None,
-                        "match_count": None,
-                    }
-                    files.append(file_info)
-                except OSError:
-                    continue
+            for line in stdout.strip().split('\n'):
+                if line:
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("type") == "match":
+                            file_path = entry.get("data", {}).get("path", {}).get("text", "")
+                            
+                            # Check if already in results
+                            existing = next((r for r in results if r["path"] == file_path), None)
+                            if not existing:
+                                file_info = {"path": file_path}
+                                
+                                if include_stats:
+                                    try:
+                                        path_obj = Path(file_path)
+                                        if path_obj.exists():
+                                            stat = path_obj.stat()
+                                            file_info.update({
+                                                "size": stat.st_size,
+                                                "file_type": path_obj.suffix.lstrip('.') or 'no_extension',
+                                            })
+                                    except Exception:
+                                        pass
+                                
+                                results.append(file_info)
+                    except json.JSONDecodeError:
+                        continue
         
+        # Limit results
+        if len(results) > _plugin_config["max_results"]:
+            results = results[:_plugin_config["max_results"]]
+        
+        return {
+            "query": {
+                "name_pattern": name_pattern,
+                "content_pattern": content_pattern,
+                "paths": validated_paths,
+                "max_size": max_size,
+                "include_stats": include_stats,
+            },
+            "results": {
+                "total_files": len(results),
+                "files": results,
+            },
+            "error": None,
+        }
+    
+    except Exception as e:
         return {
             "query": {
                 "name_pattern": name_pattern,
                 "content_pattern": content_pattern,
                 "paths": paths,
                 "max_size": max_size,
+                "include_stats": include_stats,
             },
-            "results": {
-                "total_files": len(files),
-                "files": files,
-            },
-        }
-        
-    except Exception as e:
-        return {
-            "query": {"name_pattern": name_pattern, "content_pattern": content_pattern, "paths": paths},
-            "results": {"total_files": 0, "files": []},
-            "error": str(e)
+            "results": None,
+            "error": str(e),
         }
 
 
@@ -464,47 +541,49 @@ async def get_file_context_impl(
     context_lines: int = 10,
     include_line_numbers: bool = True,
 ) -> Dict[str, Any]:
-    """Implementation of file context functionality."""
-    config = Config()
-    
-    if not config.is_path_allowed(file_path):
-        return {
-            "query": {"file_path": file_path, "line_number": line_number, "context_lines": context_lines},
-            "error": "File path not allowed"
-        }
-    
+    """Implementation for get_file_context function."""
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
+        if line_number < 1:
+            raise ValueError("Line number must be >= 1")
+        
+        # Validate file path
+        validated_paths = _validate_paths([file_path])
+        actual_file_path = validated_paths[0]
+        
+        # Read file
+        try:
+            with open(actual_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {file_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read file: {e}")
         
         total_lines = len(lines)
         
-        if line_number < 1 or line_number > total_lines:
-            return {
-                "query": {"file_path": file_path, "line_number": line_number, "context_lines": context_lines},
-                "error": f"Line number {line_number} is out of range (file has {total_lines} lines)"
-            }
+        if line_number > total_lines:
+            raise ValueError(f"Line number {line_number} exceeds file length ({total_lines} lines)")
         
-        # Calculate context boundaries
+        # Calculate context range
         start_line = max(1, line_number - context_lines)
         end_line = min(total_lines, line_number + context_lines)
         
         # Extract context
-        target_line = lines[line_number - 1].rstrip('\n')
-        before_context = []
-        after_context = []
+        target_content = lines[line_number - 1].rstrip() if line_number <= total_lines else ""
         
+        before_context = []
         for i in range(start_line - 1, line_number - 1):
-            line_content = lines[i].rstrip('\n')
+            line_content = lines[i].rstrip()
             if include_line_numbers:
-                before_context.append(f"{i + 1}: {line_content}")
+                before_context.append(f"{i + 1:4d}: {line_content}")
             else:
                 before_context.append(line_content)
         
-        for i in range(line_number, end_line):
-            line_content = lines[i].rstrip('\n')
+        after_context = []
+        for i in range(line_number, min(end_line, total_lines)):
+            line_content = lines[i].rstrip()
             if include_line_numbers:
-                after_context.append(f"{i + 1}: {line_content}")
+                after_context.append(f"{i + 1:4d}: {line_content}")
             else:
                 after_context.append(line_content)
         
@@ -513,22 +592,30 @@ async def get_file_context_impl(
                 "file_path": file_path,
                 "line_number": line_number,
                 "context_lines": context_lines,
+                "include_line_numbers": include_line_numbers,
             },
             "result": {
-                "file": file_path,
+                "file": actual_file_path,
                 "target_line": line_number,
-                "content": f"{line_number}: {target_line}" if include_line_numbers else target_line,
+                "content": target_content,
                 "before_context": before_context,
                 "after_context": after_context,
-                "total_context_lines": len(before_context) + len(after_context) + 1,
+                "total_context_lines": len(before_context) + 1 + len(after_context),
                 "file_total_lines": total_lines,
             },
+            "error": None,
         }
-        
-    except (OSError, UnicodeDecodeError) as e:
+    
+    except Exception as e:
         return {
-            "query": {"file_path": file_path, "line_number": line_number, "context_lines": context_lines},
-            "error": f"Could not read file: {str(e)}"
+            "query": {
+                "file_path": file_path,
+                "line_number": line_number,
+                "context_lines": context_lines,
+                "include_line_numbers": include_line_numbers,
+            },
+            "result": None,
+            "error": str(e),
         }
 
 
@@ -539,109 +626,175 @@ async def analyze_codebase_impl(
     include_language_stats: bool = True,
     max_files_to_scan: int = 1000,
 ) -> Dict[str, Any]:
-    """Implementation of codebase analysis functionality."""
-    config = Config()
-    paths = paths or ["."]
-    
-    # Validate paths
-    for path in paths:
-        if not config.is_path_allowed(path):
-            return {
-                "query": {"paths": paths, "include_metrics": include_metrics},
-                "results": {},
-                "error": f"Path not allowed: {path}"
-            }
-    
+    """Implementation for analyze_codebase function."""
     try:
-        # Find all files
-        file_result = await search_files_impl(paths=paths, include_stats=True)
+        validated_paths = _validate_paths(paths)
         
-        if file_result.get("error"):
-            return file_result
+        # Get file listing
+        cmd = [_get_ripgrep_executable(), "--files"]
         
-        all_files = file_result["results"]["files"]
+        # Add file type filters
+        if file_types:
+            for file_type in file_types:
+                file_type = file_type.lstrip(".")
+                cmd.extend(["-t", file_type])
         
-        # Calculate basic statistics
-        total_files = len(all_files)
-        total_size = sum(f.get("size", 0) or 0 for f in all_files)
+        # Blocked patterns
+        for blocked in _plugin_config["blocked_patterns"]:
+            cmd.extend(["--glob", f"!{blocked}"])
         
-        # Count by file type
+        cmd.extend(validated_paths)
+        
+        stdout, stderr, returncode = await _run_ripgrep_command(cmd)
+        
+        all_files = []
+        for line in stdout.strip().split('\n'):
+            if line:
+                all_files.append(line.strip())
+        
+        # Limit files to scan
+        if len(all_files) > max_files_to_scan:
+            all_files = all_files[:max_files_to_scan]
+        
+        # Analyze files
         file_types_count = {}
-        for file_info in all_files:
-            ext = file_info.get("file_type") or "no_extension"
-            file_types_count[ext] = file_types_count.get(ext, 0) + 1
-        
-        # Find largest files
-        largest_files = sorted(
-            [f for f in all_files if f.get("size")],
-            key=lambda f: f["size"],
-            reverse=True
-        )[:10]
-        
-        # Format largest files
-        largest_files_formatted = []
-        for file_info in largest_files:
-            largest_files_formatted.append({
-                "path": file_info["path"],
-                "size": file_info["size"],
-                "size_mb": round(file_info["size"] / (1024 * 1024), 2),
-                "file_type": file_info.get("file_type"),
-            })
-        
-        # Estimate total lines if requested
-        total_lines = 0
-        if include_metrics and all_files:
-            sample_files = all_files[:min(max_files_to_scan, len(all_files))]
-            for file_info in sample_files:
-                try:
-                    with open(file_info["path"], 'r', encoding='utf-8', errors='ignore') as f:
-                        lines = sum(1 for _ in f)
-                        total_lines += lines
-                except (OSError, UnicodeDecodeError):
-                    continue
-        
-        # Language stats (simplified)
         language_stats = {}
-        if include_language_stats:
-            language_map = {
-                "py": "Python", "js": "JavaScript", "ts": "TypeScript",
-                "java": "Java", "c": "C", "cpp": "C++", "h": "C/C++",
-                "cs": "C#", "go": "Go", "rs": "Rust", "rb": "Ruby",
-                "php": "PHP", "md": "Markdown", "html": "HTML",
-                "css": "CSS", "json": "JSON", "xml": "XML", "yml": "YAML", "yaml": "YAML"
-            }
-            
-            for ext, count in file_types_count.items():
-                if ext in language_map:
-                    lang = language_map[ext]
-                    if lang not in language_stats:
-                        language_stats[lang] = {"files": 0, "extensions": []}
-                    language_stats[lang]["files"] += count
-                    if ext not in language_stats[lang]["extensions"]:
-                        language_stats[lang]["extensions"].append(ext)
+        total_size = 0
+        total_lines = 0
+        largest_files = []
         
+        for file_path in all_files:
+            try:
+                path_obj = Path(file_path)
+                if not path_obj.exists():
+                    continue
+                
+                stat = path_obj.stat()
+                file_size = stat.st_size
+                total_size += file_size
+                
+                file_ext = path_obj.suffix.lstrip('.') or 'no_extension'
+                file_types_count[file_ext] = file_types_count.get(file_ext, 0) + 1
+                
+                # Count lines if metrics enabled
+                if include_metrics:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            line_count = sum(1 for _ in f)
+                        total_lines += line_count
+                        
+                        largest_files.append({
+                            "path": file_path,
+                            "size": file_size,
+                            "lines": line_count,
+                        })
+                    except Exception:
+                        pass
+                
+                # Language statistics
+                if include_language_stats:
+                    language = _detect_language(file_ext)
+                    if language not in language_stats:
+                        language_stats[language] = {"files": 0, "size": 0, "lines": 0}
+                    language_stats[language]["files"] += 1
+                    language_stats[language]["size"] += file_size
+                    if include_metrics and 'line_count' in locals():
+                        language_stats[language]["lines"] += line_count
+            
+            except Exception:
+                continue
+        
+        # Sort largest files
+        largest_files.sort(key=lambda x: x["size"], reverse=True)
+        largest_files = largest_files[:10]  # Top 10
+        
+        return {
+            "query": {
+                "paths": validated_paths,
+                "include_metrics": include_metrics,
+                "file_types": file_types,
+                "include_language_stats": include_language_stats,
+                "max_files_to_scan": max_files_to_scan,
+            },
+            "results": {
+                "summary": {
+                    "total_files": len(all_files),
+                    "total_size": total_size,
+                    "total_lines": total_lines if include_metrics else None,
+                },
+                "file_types": file_types_count,
+                "largest_files": largest_files if include_metrics else [],
+                "language_stats": language_stats if include_language_stats else {},
+                "directory_breakdown": _analyze_directory_structure(all_files),
+            },
+            "error": None,
+        }
+    
+    except Exception as e:
         return {
             "query": {
                 "paths": paths,
                 "include_metrics": include_metrics,
                 "file_types": file_types,
+                "include_language_stats": include_language_stats,
+                "max_files_to_scan": max_files_to_scan,
             },
-            "results": {
-                "summary": {
-                    "total_files": total_files,
-                    "total_lines": total_lines if include_metrics else None,
-                    "total_size_bytes": total_size,
-                    "total_size_mb": round(total_size / (1024 * 1024), 2),
-                },
-                "file_types": file_types_count,
-                "largest_files": largest_files_formatted,
-                "language_stats": language_stats if include_language_stats else {},
-            },
+            "results": None,
+            "error": str(e),
         }
+
+
+def _detect_language(file_ext: str) -> str:
+    """Detect programming language from file extension."""
+    language_map = {
+        'py': 'Python',
+        'js': 'JavaScript',
+        'ts': 'TypeScript',
+        'java': 'Java',
+        'cpp': 'C++',
+        'c': 'C',
+        'h': 'C/C++',
+        'rs': 'Rust',
+        'go': 'Go',
+        'php': 'PHP',
+        'rb': 'Ruby',
+        'swift': 'Swift',
+        'kt': 'Kotlin',
+        'cs': 'C#',
+        'html': 'HTML',
+        'css': 'CSS',
+        'scss': 'SCSS',
+        'json': 'JSON',
+        'xml': 'XML',
+        'yaml': 'YAML',
+        'yml': 'YAML',
+        'md': 'Markdown',
+        'sql': 'SQL',
+        'sh': 'Shell',
+        'bash': 'Shell',
+        'ps1': 'PowerShell',
+    }
+    
+    return language_map.get(file_ext.lower(), 'Other')
+
+
+def _analyze_directory_structure(files: List[str]) -> Dict[str, Any]:
+    """Analyze directory structure from file list."""
+    directories = {}
+    
+    for file_path in files:
+        path_obj = Path(file_path)
+        directory = str(path_obj.parent)
         
-    except Exception as e:
-        return {
-            "query": {"paths": paths, "include_metrics": include_metrics},
-            "results": {},
-            "error": str(e)
-        } 
+        if directory not in directories:
+            directories[directory] = {"files": 0, "total_size": 0}
+        
+        directories[directory]["files"] += 1
+        
+        try:
+            if path_obj.exists():
+                directories[directory]["total_size"] += path_obj.stat().st_size
+        except Exception:
+            pass
+    
+    return directories 
